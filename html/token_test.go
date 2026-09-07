@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -830,6 +840,82 @@ func TestSelfClosingTagValueConfusion(t *testing.T) {
 	tok := z.Next()
 	if tok != StartTagToken {
 		t.Fatalf("unexpected token type: got %s, want %s", tok, StartTagToken)
+	}
+}
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributes(t *testing.T) {
+	// Browsers keep only the first occurrence of a duplicate attribute name.
+	// A tokenizer that reports every occurrence lets an attacker smuggle a
+	// second, dangerous value past code that inspects the attributes.
+	tests := []struct {
+		desc string
+		in   string
+		want []Attribute
+	}{
+		{
+			"duplicate href",
+			`<a href="https://example.com/" href="javascript:alert(1)">`,
+			[]Attribute{{Key: "href", Val: "https://example.com/"}},
+		},
+		{
+			"duplicate href, different ASCII case",
+			`<a HREF="https://example.com/" hReF="javascript:alert(1)">`,
+			[]Attribute{{Key: "href", Val: "https://example.com/"}},
+		},
+		{
+			"duplicate event handler",
+			`<img src="x" onerror="safe()" OnErRoR="alert(1)">`,
+			[]Attribute{{Key: "src", Val: "x"}, {Key: "onerror", Val: "safe()"}},
+		},
+		{
+			"unquoted duplicates",
+			`<p a=1 a=2 a=3>`,
+			[]Attribute{{Key: "a", Val: "1"}},
+		},
+	}
+	for _, test := range tests {
+		z := NewTokenizer(strings.NewReader(test.in))
+		if tt := z.Next(); tt != StartTagToken {
+			t.Errorf("%s: got token type %s, want %s", test.desc, tt, StartTagToken)
+			continue
+		}
+		if got := z.Token().Attr; !reflect.DeepEqual(got, test.want) {
+			t.Errorf("%s: attributes are %v, want %v", test.desc, got, test.want)
+		}
+	}
+
+	// The set of attribute names seen so far is per-tag: a name dropped as a
+	// duplicate in one tag must still be reported for the next tag.
+	z := NewTokenizer(strings.NewReader(`<p a="1" a="2"><p a="3">`))
+	for i, want := range []string{"1", "3"} {
+		if tt := z.Next(); tt != StartTagToken {
+			t.Fatalf("tag %d: got token type %s, want %s", i, tt, StartTagToken)
+		}
+		got := z.Token().Attr
+		if len(got) != 1 || got[0].Key != "a" || got[0].Val != want {
+			t.Errorf("tag %d: attributes are %v, want [a=%q]", i, got, want)
+		}
 	}
 }
 
