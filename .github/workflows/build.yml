@@ -1,0 +1,92 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run; empty runs the full suite
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: auto
+      GOPROXY: https://time-machines-go.sealsecurity.io/|https://proxy.golang.org|direct
+      GONOSUMDB: "*"
+      GOFLAGS: -mod=mod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: true
+
+      - name: Report toolchain
+        run: go version
+
+      # The module zip is packed from a staging copy of the tree so that this
+      # workflow (upstream ships no .github/ at all) never becomes a member of
+      # the published artifact. .git/ and vendor/ are dropped by CreateFromDir
+      # itself; excluding .git here just keeps the copy cheap.
+      - name: Stage module tree
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/modsrc
+          rsync -a --exclude=.git --exclude=.github ./ /tmp/modsrc/
+
+      # golang.org/x/mod/zip.CreateFromDir is Go's own module-zip writer, so it
+      # applies exactly the inclusion rules proxy.golang.org applied to v0.45.0.
+      # It lives in its own module under /tmp so building it cannot touch the
+      # library's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zipper
+          cp .github/zipper/main.go /tmp/zipper/main.go
+          cd /tmp/zipper
+          go mod init example.com/zipper
+          go get golang.org/x/mod
+
+      - name: Create module zip
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/build_output"
+          cd /tmp/zipper
+          go run . golang.org/x/net v0.45.0 /tmp/modsrc "${GITHUB_WORKSPACE}/build_output/v0.45.0.zip"
+          unzip -l "${GITHUB_WORKSPACE}/build_output/v0.45.0.zip" | tail -n 5
+
+      - name: Build
+        run: go build ./...
+
+      # Full suite by default. A non-empty test-filter runs only the named
+      # top-level tests, and the per-name grep fails closed because `go test`
+      # exits 0 when -run matches nothing.
+      - name: Test
+        run: |
+          set -euo pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "${FILTER}" ]; then
+            go test -v -count=1 -timeout 30m -run "^($(echo "${FILTER}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${FILTER}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test -count=1 -timeout 30m ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
